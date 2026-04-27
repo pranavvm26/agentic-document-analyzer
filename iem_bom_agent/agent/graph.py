@@ -161,12 +161,15 @@ Your job is to review drawing packages by comparing an original schematic (the
 source of truth) against a wiring diagram (WD, the edited copy) and find mistakes.
 
 You have access to tools that can:
-- Convert PDFs to page images (pdf_to_images)
-- OCR page images to extract text (ocr_page_text)
-- Parse the Drawing Index from OCR text (parse_drawing_index)
+- Convert PDFs to page images (pdf_to_images) — renders at 300 DPI
+- Read Drawing Index from image (read_drawing_index_from_image) — vision-based, no OCR
+- Validate page is BOM (validate_page_is_bom) — confirms a page is actually a BOM table
+- OCR page images to extract text (ocr_page_text) — only if needed as fallback
+- Parse the Drawing Index from OCR text (parse_drawing_index) — regex fallback
 - Extract BOM tables from BOM page images (extract_bom_table_from_page)
 - Concatenate BOM CSV files (concat_bom_csvs)
 - Compare BOMs with vision (compare_boms_with_vision)
+- Compare BOM images direct (compare_bom_images_direct) — sends full BOM page images to Claude, no OCR
 - Generate BOM HTML report (generate_html_report)
 - Extract diagram pages (extract_diagram_pages)
 - Analyze 3L diagram (analyze_3l_diagram) — confirms page type + extracts curly brace labels
@@ -189,50 +192,69 @@ CRITICAL RULES:
 ═══════════════════════════════════════════════════════════════════════
 
 PAGE NUMBER MAPPING — CRITICAL:
-  The Drawing Index lists page numbers (1, 2, 3, ...). In IEM drawings,
-  there is typically a 1-page offset: Drawing Index page N corresponds to
-  PDF page N-1. For example, if the Drawing Index says BOM is on pages 5
-  and 6, the actual PDF images are likely page_004 and page_005.
-  FIRST try page_{N-1}, then page_{N} as fallback."""
+  The Drawing Index lists page numbers (1, 2, 3, ...). The PDF page keys
+  are page_001, page_002, etc. The mapping between them varies by document:
+  - Some documents have a 1-page offset (Drawing Index page N = PDF page_{N-1})
+  - Some documents have no offset (Drawing Index page N = PDF page_{N})
+  - The schematic and WD may have DIFFERENT offsets.
+  STRATEGY: For each page number N, try page_{N:03d} first. If that page
+  doesn't contain the expected content, try page_{N-1:03d} as fallback.
+  Do NOT assume the same offset for both documents."""
 
 PROMPT_COMMON_EXTRACT = """
 PHASE A: PROCESS THE SCHEMATIC (source of truth)
 ──────────────────────────────────────────────────
-A1. Call pdf_to_images for the schematic PDF (leave output_dir empty).
+A1. Call pdf_to_images for the schematic PDF (leave output_dir empty, dpi=300).
     VALIDATE: Print page count.
 
-A2. Call ocr_page_text on the schematic page_001 image.
-    VALIDATE: Confirm "DRAWING INDEX" appears.
-
-A3. Call parse_drawing_index on the schematic OCR text.
-    VALIDATE: Print the bom_pages list and any 3L pages found.
+A2. Call read_drawing_index_from_image with the schematic page_001 image path.
+    This uses vision to read the Drawing Index directly from the image —
+    no OCR needed. If page_001 has no Drawing Index, try page_002.
+    VALIDATE: Print the bom_pages and three_line_pages lists.
 
 PHASE B: PROCESS THE WIRING DIAGRAM (edited copy)
 ──────────────────────────────────────────────────
-B1–B3: Repeat A1–A3 for the Wiring Diagram PDF."""
+B1. Call pdf_to_images for the WD PDF (leave output_dir empty, dpi=300).
+    VALIDATE: Print page count.
+
+B2. Call read_drawing_index_from_image with the WD page_001 image path.
+    If page_001 has no Drawing Index, try page_002.
+    VALIDATE: Print the bom_pages and three_line_pages lists."""
 
 PROMPT_BOM_PHASES = """
-PHASE A4–A5: EXTRACT SCHEMATIC BOM
-───────────────────────────────────
-A4. For EACH BOM page number N: try page_{N-1} first. Call
-    extract_bom_table_from_page. Check columns = SEQ, QTY, ITEM,
-    MANUFACTURER, DESCRIPTION. If wrong, try page_{N}. Collect
-    csv_path and slice_images for valid pages.
+PHASE A4: IDENTIFY AND VALIDATE SCHEMATIC BOM PAGE IMAGES
+──────────────────────────────────────────────────────────
+A4. From the Drawing Index (A2), you know which page numbers are BOM pages.
+    For EACH BOM page number N:
+    a) Try page_{N:03d} first. Call validate_page_is_bom on that image.
+    b) If is_bom=true → use this page. Print "page_{N:03d}: CONFIRMED BOM"
+    c) If is_bom=false → try page_{N-1:03d}. Call validate_page_is_bom.
+    d) If is_bom=true → use this page. Print "page_{N-1:03d}: CONFIRMED BOM"
+    e) If neither is BOM → print warning and skip.
+    Only collect CONFIRMED BOM page image paths.
+    DO NOT crop — use the full uncropped page images.
 
-A5. Call concat_bom_csvs with csv_path list. Store markdown_path.
+PHASE B4: IDENTIFY AND VALIDATE WD BOM PAGE IMAGES
+───────────────────────────────────────────────────
+B4. Same as A4 but for the WD. The WD may have a DIFFERENT page offset.
+    Validate each candidate with validate_page_is_bom before using it.
 
-PHASE B4–B5: EXTRACT WD BOM
-────────────────────────────
-B4–B5: Repeat A4–A5 for the WD.
-
-PHASE C: COMPARE BOMs
-──────────────────────
-C1. Call compare_boms_with_vision with schematic_bom_pages_json and
-    wd_bom_pages_json (each entry has csv_path, slice_images, label).
+PHASE C: COMPARE BOMs (direct image comparison)
+────────────────────────────────────────────────
+C1. Call compare_bom_images_direct with:
+    - schematic_bom_image_paths_json: JSON list of SCH BOM image paths
+    - wd_bom_image_paths_json: JSON list of WD BOM image paths
+    These are FULL uncropped page images. Claude reads the BOM tables
+    directly from the images.
+    VALIDATE: Print the assessment and issue count.
 
 PHASE D: BOM HTML REPORT
 ─────────────────────────
-D1. Call generate_html_report. Output: bom_comparison_report.html
+D1. Call generate_html_report with the comparison JSON.
+    For schematic_bom_pages_json and wd_bom_pages_json, pass JSON lists
+    where each entry has: {"cropped_path": "<the image path>",
+    "label": "BOM Page N (sheet_name)"}.
+    Output: bom_comparison_report.html
 D2. Print summary: issue counts + file path."""
 
 PROMPT_CIRCUIT_PHASES = """

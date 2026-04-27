@@ -140,7 +140,7 @@ def _run_ocr(
 
 
 @mcp.tool()
-def pdf_to_images(pdf_path: str, output_dir: str = "", dpi: int = 200) -> str:
+def pdf_to_images(pdf_path: str, output_dir: str = "", dpi: int = 300) -> str:
     """Convert a PDF into per-page PNG images.
 
     Splits every page of the PDF into a separate PNG rendered at the
@@ -268,6 +268,63 @@ def parse_drawing_index(ocr_text: str) -> str:
             })
 
     return json.dumps({"entries": entries, "bom_pages": bom_pages}, indent=2)
+
+
+@mcp.tool()
+def read_drawing_index_from_image(
+    page_image_path: str,
+) -> str:
+    """Read the Drawing Index directly from a page image using Bedrock Claude vision.
+
+    Sends the page image to Claude and asks it to find and read the
+    DRAWING INDEX table. Returns structured JSON with all entries and
+    identified BOM pages. This is more reliable than OCR + regex parsing.
+
+    Args:
+        page_image_path: Path to the page image (uncropped or cropped).
+
+    Returns:
+        JSON with entries list and bom_pages list.
+    """
+    if not os.path.exists(page_image_path):
+        return json.dumps({"error": "Image not found", "entries": [], "bom_pages": []})
+
+    with open(page_image_path, "rb") as f:
+        img_bytes = f.read()
+
+    content_blocks: list[dict[str, Any]] = [
+        {"text": (
+            "Look at this electrical drawing page. Find the DRAWING INDEX table.\n"
+            "It lists all pages in the drawing package with columns like:\n"
+            "PAGE, SHEET, DESCRIPTION, INT., LAST REV ON SHEET\n\n"
+            "Extract ALL entries from the Drawing Index.\n"
+            "Identify which entries are BOM pages (description contains\n"
+            "'BILL OF MATERIAL' or sheet name contains '_BOM_').\n"
+            "Also identify 3L pages (sheet contains '_3L_').\n\n"
+            "Return a JSON object:\n"
+            '{"entries": [{"page": 1, "sheet": "11_LEG_01", "description": "LEGEND"},\n'
+            '             {"page": 5, "sheet": "11_BOM_01", "description": "BILL OF MATERIAL"}],\n'
+            ' "bom_pages": [{"page": 5, "sheet": "11_BOM_01", "description": "BILL OF MATERIAL"}],\n'
+            ' "three_line_pages": [{"page": 9, "sheet": "11_3L_01", "description": "THREE LINE DIAGRAM"}]}\n\n'
+            "If no Drawing Index is found on this page, return:\n"
+            '{"error": "No Drawing Index found", "entries": [], "bom_pages": [], "three_line_pages": []}\n'
+            "Return ONLY the JSON object."
+        )},
+        {"image": {"format": "png", "source": {"bytes": img_bytes}}},
+    ]
+
+    result = _call_bedrock(content_blocks, max_tokens=8192)
+
+    try:
+        match = re.search(r"\{.*\}", result, re.DOTALL)
+        data = json.loads(match.group()) if match else {}
+    except (json.JSONDecodeError, AttributeError):
+        data = {}
+
+    data.setdefault("entries", [])
+    data.setdefault("bom_pages", [])
+    data.setdefault("three_line_pages", [])
+    return json.dumps(data, indent=2)
 
 
 @mcp.tool()
@@ -668,6 +725,126 @@ def compare_boms_with_vision(
 
 
 @mcp.tool()
+def validate_page_is_bom(page_image_path: str) -> str:
+    """Check if a page image is actually a Bill of Material page.
+
+    Sends the uncropped page image to Bedrock Claude and asks it to
+    confirm whether this page contains a BOM table. Returns true/false
+    plus what the page actually contains.
+
+    Args:
+        page_image_path: Path to the uncropped page image.
+
+    Returns:
+        JSON with ``is_bom`` (bool), ``detected_type`` (str),
+        and ``title_block_text`` (str).
+    """
+    if not os.path.exists(page_image_path):
+        return json.dumps({"is_bom": False, "error": "Image not found"})
+
+    with open(page_image_path, "rb") as f:
+        img_bytes = f.read()
+
+    content_blocks: list[dict[str, Any]] = [
+        {"text": (
+            "Is this page a BILL OF MATERIAL (BOM) table?\n"
+            "A BOM page has columns like SEQ, QTY, ITEM, MANUFACTURER, DESCRIPTION.\n"
+            "Look at the page content and the title block at the bottom-right.\n\n"
+            "Return a JSON object:\n"
+            '{"is_bom": true, "detected_type": "BILL OF MATERIAL",\n'
+            ' "title_block_text": "text from bottom-right title block"}\n'
+            "Return ONLY the JSON object."
+        )},
+        {"image": {"format": "png", "source": {"bytes": img_bytes}}},
+    ]
+
+    result = _call_bedrock(content_blocks, max_tokens=1024)
+    try:
+        match = re.search(r"\{.*\}", result, re.DOTALL)
+        data = json.loads(match.group()) if match else {}
+    except (json.JSONDecodeError, AttributeError):
+        data = {}
+
+    data.setdefault("is_bom", False)
+    data.setdefault("detected_type", "UNKNOWN")
+    return json.dumps(data, indent=2)
+
+
+@mcp.tool()
+def compare_bom_images_direct(
+    schematic_bom_image_paths_json: str,
+    wd_bom_image_paths_json: str,
+) -> str:
+    """Compare BOM pages by sending full page images directly to Bedrock Claude.
+
+    No OCR, no slicing, no table extraction. Just sends the cropped BOM
+    page images from both documents and asks Claude to compare them visually.
+
+    Args:
+        schematic_bom_image_paths_json: JSON list of cropped SCH BOM image paths.
+        wd_bom_image_paths_json: JSON list of cropped WD BOM image paths.
+
+    Returns:
+        JSON comparison report with issues and assessment.
+    """
+    sch_paths: list[str] = json.loads(schematic_bom_image_paths_json)
+    wd_paths: list[str] = json.loads(wd_bom_image_paths_json)
+
+    content_blocks: list[dict[str, Any]] = [
+        {"text": (
+            "BOM COMPARISON — DIRECT IMAGE ANALYSIS\n\n"
+            "Compare the Bill of Material (BOM) pages between a SCHEMATIC\n"
+            "(source of truth) and a WIRING DIAGRAM (WD, edited copy).\n\n"
+            "I am sending you the full BOM page images from both documents.\n"
+            "Read the tables directly from the images. Compare row by row.\n\n"
+            "FOCUS ON: SEQ, QTY, ITEM, MANUFACTURER columns.\n"
+            "DESCRIPTION differences are NUISANCE — list them separately.\n\n"
+            "FALSE POSITIVES ARE EXTREMELY COSTLY. Only flag differences\n"
+            "you can clearly read in both images. When in doubt, do not flag.\n\n"
+            "PRIORITY:\n"
+            "- HIGH: Entire row missing from one document\n"
+            "- MEDIUM: Clear value mismatch in SEQ/QTY/ITEM/MANUFACTURER\n"
+            "- LOW: Minor typo-level difference\n"
+            "- Do NOT flag anything you cannot clearly read\n\n"
+            "Return a JSON object:\n"
+            '{"summary": {"schematic_rows": N, "wd_rows": N, "matched": N,\n'
+            '  "mismatched": N, "missing_from_wd": N, "extra_in_wd": N},\n'
+            ' "issues": [{"seq": N, "column": "...", "schematic_value": "...",\n'
+            '   "wd_value": "...", "priority": "HIGH|MEDIUM|LOW",\n'
+            '   "note": "..."}],\n'
+            ' "nuisance": [{"seq": N, "schematic_desc_snippet": "...",\n'
+            '   "wd_desc_snippet": "...", "note": "..."}],\n'
+            ' "assessment": "1-2 sentence crisp summary"}\n\n'
+        )},
+    ]
+
+    content_blocks.append({"text": "=== SCHEMATIC BOM PAGES (Source of Truth) ==="})
+    for i, path in enumerate(sch_paths):
+        if os.path.exists(path):
+            content_blocks.append({"text": f"Schematic BOM Page {i + 1}:"})
+            with open(path, "rb") as f:
+                content_blocks.append({
+                    "image": {"format": "png", "source": {"bytes": f.read()}},
+                })
+
+    content_blocks.append({"text": "\n=== WIRING DIAGRAM BOM PAGES (Edited Copy) ==="})
+    for i, path in enumerate(wd_paths):
+        if os.path.exists(path):
+            content_blocks.append({"text": f"WD BOM Page {i + 1}:"})
+            with open(path, "rb") as f:
+                content_blocks.append({
+                    "image": {"format": "png", "source": {"bytes": f.read()}},
+                })
+
+    content_blocks.append({"text": (
+        "\nCompare the SCHEMATIC BOM pages against the WD BOM pages.\n"
+        "Read directly from the images. Return ONLY the JSON object."
+    )})
+
+    return _call_bedrock(content_blocks, max_tokens=16384)
+
+
+@mcp.tool()
 def generate_html_report(
     comparison_json: str,
     schematic_bom_pages_json: str,
@@ -742,11 +919,19 @@ def generate_html_report(
         for pg in pages:
             lbl = pg.get("label", "BOM Page")
             parts.append(f'<div class="bom-page"><h4>{doc}: {lbl}</h4>')
-            parts.append('<div class="slice-row">')
-            for ip in pg.get("slice_images", []):
-                if os.path.exists(ip):
-                    parts.append(f'<img src="data:image/png;base64,{_image_to_b64(ip)}" class="slice-img">')
-            parts.append('</div>')
+
+            cropped = pg.get("cropped_path", "")
+            if cropped and os.path.exists(cropped):
+                parts.append(f'<img src="data:image/png;base64,{_image_to_b64(cropped)}" class="slice-img" style="max-width:100%">')
+
+            slices = pg.get("slice_images", [])
+            if slices:
+                parts.append('<div class="slice-row">')
+                for ip in slices:
+                    if os.path.exists(ip):
+                        parts.append(f'<img src="data:image/png;base64,{_image_to_b64(ip)}" class="slice-img">')
+                parts.append('</div>')
+
             cp = pg.get("csv_path", "")
             if cp and os.path.exists(cp):
                 df = pd.read_csv(cp)
